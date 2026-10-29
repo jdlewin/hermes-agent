@@ -317,6 +317,24 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
+            # Q-07: voice-turn commentary speaks in VC instead of posting text. Sync-cheap
+            # precheck (turn type + shared switch + live VC); the scheduled helper re-verifies,
+            # speaks the first ack per turn, audits everything, and drops the text twin.
+            try:
+                if (getattr(ctx, "voice_turn", False) and (text or "").strip()
+                        and self._q07_voice_only_chat(ctx.source.chat_id)):
+                    _bind = getattr(adapter, "_voice_text_channels", None) or {}
+                    _cls = getattr(adapter, "_voice_clients", None) or {}
+                    for _g, _tc in _bind.items():
+                        _vc = _cls.get(_g)
+                        if str(_tc) == str(ctx.source.chat_id) and _vc is not None and callable(
+                                getattr(_vc, "is_connected", None)) and _vc.is_connected():
+                            self._schedule(
+                                self._q07_voice_road_speak(ctx, adapter, text, "commentary"),
+                                "q07 commentary speech scheduling error")
+                            return
+            except Exception:
+                pass
             unseen = False
             if local_viewer_route and not already_streamed and str(text or "").strip():
                 # LocalSessionAdapter.send publishes nothing, so unstreamed commentary handed to the

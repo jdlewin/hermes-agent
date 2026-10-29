@@ -64,6 +64,7 @@ class ModelInfo:
     cost_output: float = 0.0
     cost_cache_read: Optional[float] = None
     cost_cache_write: Optional[float] = None
+    cost_tiers: tuple[dict, ...] = ()
     # Metadata
     knowledge_cutoff: str = ""
     release_date: str = ""
@@ -988,6 +989,7 @@ def _parse_model_info(model_id: str, raw: dict[str, Any], provider_id: str) -> M
         context_window=_extract_limit(raw, "context") or 0, max_output=_extract_limit(raw, "output") or 0, max_input=_extract_limit(raw, "input"),
         cost_input=float(cost.get("input", 0) or 0), cost_output=float(cost.get("output", 0) or 0),
         cost_cache_read=_cost("cache_read"), cost_cache_write=_cost("cache_write"),
+        cost_tiers=tuple(t for t in (cost.get("tiers") or ()) if isinstance(t, dict)),
         knowledge_cutoff=raw.get("knowledge", "") or "", release_date=raw.get("release_date", "") or "",
         status=raw.get("status", "") or "", interleaved=raw.get("interleaved", False),
     )

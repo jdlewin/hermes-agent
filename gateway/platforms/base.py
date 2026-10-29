@@ -1913,6 +1913,9 @@ class BasePlatformAdapter(ABC):
         # Auto-TTS on voice input: ``voice.auto_tts`` default plus per-chat /voice on|tts / off.
         self._auto_tts_default: bool = False
         self._auto_tts_enabled_chats, self._auto_tts_disabled_chats = set(), set()
+        # Q-07 voice-only chats: voice replies play in VC with no text twin. Mirrored from
+        # the runner's voice_mode (voice_only only — mode all keeps text+voice).
+        self._voice_only_chats: set = set()
         # Turn keys where streaming TTS already delivered audio; whole-file auto-TTS skips them.
         # When the gateway streaming-TTS consumer successfully delivers audio, it adds the turn key here so
         # the base adapter's whole-file auto-TTS path skips the duplicate. Cleared after the turn completes.
@@ -2042,6 +2045,61 @@ class BasePlatformAdapter(ABC):
         """
         return chat_id in self._auto_tts_enabled_chats or (
             chat_id not in self._auto_tts_disabled_chats and bool(self._auto_tts_default))
+
+    # Q-07 voice-only audit path (mirrors the runner's; same file).
+    _Q07_AUDIT_PATH = "/Users/lawrence/ops/discord-voice-build/q07-audit.log"
+    _Q07_MODE_PATH = "/Users/lawrence/.hermes/gateway_voice_mode.json"
+
+    @staticmethod
+    def _voice_only_for_chat(chat_id) -> bool:
+        """Profile-proof voice_only check: ANY profile key for this chat with voice_only
+        counts, across the gateway root file and every profile home file.
+        Reads the shared mode files live (no restart lag, no per-adapter drift)."""
+        try:
+            import glob as _glob
+            import json as _json
+            paths = ["/Users/lawrence/.hermes/gateway_voice_mode.json"] + sorted(
+                _glob.glob("/Users/lawrence/.hermes/profiles/*/gateway_voice_mode.json"))
+            for _p in paths:
+                try:
+                    with open(_p, encoding="utf-8-sig") as _f:
+                        data = _json.load(_f)
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if any(str(k).split(":")[-1] == str(chat_id) and v == "voice_only"
+                       for k, v in data.items()):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _chat_voice_bound(self, chat_id) -> bool:
+        """True when this adapter holds a live VC bound to ``chat_id`` (duck-typed;
+        adapters without voice state simply read False)."""
+        try:
+            bind = getattr(self, "_voice_text_channels", None) or {}
+            clients = getattr(self, "_voice_clients", None) or {}
+            for gid, tc in bind.items():
+                if str(tc) == str(chat_id):
+                    vc = clients.get(gid)
+                    if vc is not None and callable(getattr(vc, "is_connected", None)) \
+                            and vc.is_connected():
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _q07_audit_reply(self, text_content: str) -> None:
+        try:
+            import time as _time
+            line = "{} reply user=voice {}\n".format(
+                _time.strftime("%Y-%m-%dT%H:%M:%S"), str(text_content or "")[:500])
+            with open(self._Q07_AUDIT_PATH, "a", encoding="utf-8") as _f:
+                _f.write(line)
+        except OSError:
+            pass
 
     def set_fatal_error_handler(self, handler: "Callable[[BasePlatformAdapter], Awaitable[None] | None]") -> None:
         self._fatal_error_handler = handler
@@ -4530,7 +4588,16 @@ class BasePlatformAdapter(ABC):
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered:
+                # Q-07: voice-only (file-backed, profile-proof) + TTS played + VC-bound
+                # — audit instead of posting text.
+                _voice_only_no_text = (
+                    event.message_type == MessageType.VOICE
+                    and self._voice_only_for_chat(event.source.chat_id)
+                    and bool(_tts_paths)
+                    and self._chat_voice_bound(event.source.chat_id))
+                if _voice_only_no_text:
+                    self._q07_audit_reply(text_content)
+                if text_content and not _tts_caption_delivered and not _voice_only_no_text:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)

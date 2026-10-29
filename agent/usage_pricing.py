@@ -526,25 +526,56 @@ def _pricing_entry_from_metadata(
         return None
     pricing = metadata[model_id].get("pricing") or {}
 
-    def per_million(key: str, *aliases: str) -> Optional[Decimal]:
-        raw = pricing.get(key)
+    def per_million(src: dict[str, Any], key: str, *aliases: str) -> Optional[Decimal]:
+        raw = src.get(key)
         for alias in aliases:  # alias chain is truthiness-based (``a or b or c``)
-            raw = raw or pricing.get(alias)
+            raw = raw or src.get(alias)
         value = _to_decimal(raw)
         return None if value is None else value * _ONE_MILLION
 
-    prompt = per_million("prompt")
-    completion = per_million("completion")
+    prompt = per_million(pricing, "prompt")
+    completion = per_million(pricing, "completion")
     request = _to_decimal(pricing.get("request"))
     if prompt is None and completion is None and request is None:
         return None
-    return PricingEntry(
+    entry = PricingEntry(
         input_cost_per_million=prompt, output_cost_per_million=completion,
-        cache_read_cost_per_million=per_million("cache_read", "cached_prompt", "input_cache_read"),
-        cache_write_cost_per_million=per_million("cache_write", "cache_creation", "input_cache_write"),
+        cache_read_cost_per_million=per_million(pricing, "cache_read", "cached_prompt", "input_cache_read"),
+        cache_write_cost_per_million=per_million(pricing, "cache_write", "cache_creation", "input_cache_write"),
         request_cost=request, source="provider_models_api", source_url=source_url,
         pricing_version=pricing_version, fetched_at=_UTC_NOW(),
     )
+
+    # OpenRouter exposes context-tier overrides under ``pricing.overrides[]``.
+    # A context tier is identified by ``min_prompt_tokens``; the override rates
+    # apply to the whole request once the threshold is crossed, matching the
+    # existing whole-request tier machinery in ``estimate_usage_cost``.
+    overrides = pricing.get("overrides") or []
+    if isinstance(overrides, list):
+        for override in overrides:
+            if not isinstance(override, dict):
+                continue
+            threshold = override.get("min_prompt_tokens")
+            if threshold is None:
+                continue
+            try:
+                threshold = int(threshold)
+            except Exception:
+                continue
+            entry = replace(
+                entry,
+                tier_threshold_tokens=threshold,
+                input_cost_per_million_above=per_million(override, "prompt"),
+                output_cost_per_million_above=per_million(override, "completion"),
+                cache_read_cost_per_million_above=per_million(
+                    override, "cache_read", "cached_prompt", "input_cache_read"
+                ),
+                cache_write_cost_per_million_above=per_million(
+                    override, "cache_write", "cache_creation", "input_cache_write"
+                ),
+            )
+            break
+    return entry
 
 
 
@@ -562,7 +593,7 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     model_info = get_model_info(route.provider, route.model)
     if model_info is None or not model_info.has_cost_data():
         return None
-    return PricingEntry(
+    entry = PricingEntry(
         input_cost_per_million=_to_decimal(model_info.cost_input),
         output_cost_per_million=_to_decimal(model_info.cost_output),
         cache_read_cost_per_million=_to_decimal(model_info.cost_cache_read),
@@ -570,6 +601,34 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
         source="provider_models_api", source_url="https://models.dev", pricing_version="models.dev",
         fetched_at=_UTC_NOW(),
     )
+
+    # models.dev keeps whole-request context tiers under ``cost.tiers[]``
+    # (e.g. claude-haiku-5.5 bills 5x above 100k prompt tokens). The rates are
+    # already USD per 1M tokens, so they map directly onto PricingEntry.
+    tiers = getattr(model_info, "cost_tiers", None) or ()
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        tier_meta = tier.get("tier") or {}
+        if tier_meta.get("type") != "context":
+            continue
+        size = tier_meta.get("size")
+        if size is None:
+            continue
+        try:
+            threshold = int(size)
+        except Exception:
+            continue
+        entry = replace(
+            entry,
+            tier_threshold_tokens=threshold,
+            input_cost_per_million_above=_to_decimal(tier.get("input")),
+            output_cost_per_million_above=_to_decimal(tier.get("output")),
+            cache_read_cost_per_million_above=_to_decimal(tier.get("cache_read")),
+            cache_write_cost_per_million_above=_to_decimal(tier.get("cache_write")),
+        )
+        break
+    return entry
 
 
 def get_pricing_entry(

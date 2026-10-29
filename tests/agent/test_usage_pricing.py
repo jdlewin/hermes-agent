@@ -924,3 +924,143 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Context-tier parsing from OpenRouter overrides and models.dev cost.tiers
+# ---------------------------------------------------------------------------
+
+
+def test_openrouter_pricing_entry_parses_context_tier_override(monkeypatch):
+    """pricing.overrides[] can carry a whole-request context tier (e.g.
+    Anthropic Haiku 5.5 past 100k prompt tokens). It must populate
+    tier_threshold_tokens and the *_above rates so estimate_usage_cost
+    applies the higher tier."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "anthropic/claude-haiku-5.5": {
+                "pricing": {
+                    "prompt": "0.0000001",
+                    "completion": "0.0000005",
+                    "input_cache_read": "0.00000001",
+                    "input_cache_write": "0.000000125",
+                    "overrides": [
+                        {
+                            "min_prompt_tokens": 100_000,
+                            "prompt": "0.0000005",
+                            "completion": "0.0000025",
+                            "input_cache_read": "0.00000005",
+                            "input_cache_write": "0.000000625",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    entry = get_pricing_entry("anthropic/claude-haiku-5.5", provider="openrouter")
+    assert entry is not None
+    assert entry.tier_threshold_tokens == 100_000
+    assert entry.input_cost_per_million_above == Decimal("0.5")
+    assert entry.output_cost_per_million_above == Decimal("2.5")
+    assert entry.cache_read_cost_per_million_above == Decimal("0.05")
+    assert entry.cache_write_cost_per_million_above == Decimal("0.625")
+
+    below = estimate_usage_cost(
+        "anthropic/claude-haiku-5.5",
+        CanonicalUsage(input_tokens=50_000, output_tokens=10_000),
+        provider="openrouter",
+    )
+    above = estimate_usage_cost(
+        "anthropic/claude-haiku-5.5",
+        CanonicalUsage(input_tokens=150_000, output_tokens=10_000),
+        provider="openrouter",
+    )
+    # 50k * $0.1/M + 10k * $0.5/M
+    assert below.amount_usd == Decimal("0.01")
+    # 150k prompt > 100k -> whole request at tier rates ($0.5 input / $2.5 output)
+    assert above.amount_usd == Decimal("0.10")
+    assert above.amount_usd > below.amount_usd
+
+
+def test_openrouter_non_context_overrides_do_not_create_false_tiers(monkeypatch):
+    """Time-of-day overrides (``utc_days``/``utc_start``) are not context tiers
+    and must not set ``tier_threshold_tokens``."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "deepseek/deepseek-v4.1-flash": {
+                "pricing": {
+                    "prompt": "0.00000015",
+                    "completion": "0.0000006",
+                    "overrides": [
+                        {
+                            "utc_days": ["monday"],
+                            "utc_start": 0,
+                            "utc_end": 100,
+                            "prompt": "0.00000015",
+                            "completion": "0.0000006",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    entry = get_pricing_entry("deepseek/deepseek-v4.1-flash", provider="openrouter")
+    assert entry is not None
+    assert entry.tier_threshold_tokens is None
+
+
+def test_models_dev_pricing_entry_parses_cost_tiers(monkeypatch):
+    """models.dev keeps context tiers under ``cost.tiers[]``; the direct-route
+    lookup must map them onto ``PricingEntry`` tier fields."""
+    from agent.models_dev import ModelInfo
+
+    def fake_model_info(provider_id: str, model_id: str):
+        return ModelInfo(
+            id=model_id,
+            name=model_id,
+            family="claude-haiku",
+            provider_id=provider_id,
+            cost_input=0.1,
+            cost_output=0.5,
+            cost_cache_read=0.01,
+            cost_cache_write=0.125,
+            cost_tiers=(
+                {
+                    "input": 0.5,
+                    "output": 2.5,
+                    "cache_read": 0.05,
+                    "cache_write": 0.625,
+                    "tier": {"type": "context", "size": 100_000},
+                },
+            ),
+        )
+
+    monkeypatch.setattr("agent.models_dev.get_model_info", fake_model_info)
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_a, **_k: {})
+
+    entry = get_pricing_entry("claude-haiku-5-5", provider="xai", base_url="https://api.x.ai/v1")
+    assert entry is not None
+    assert entry.tier_threshold_tokens == 100_000
+    assert entry.input_cost_per_million == Decimal("0.1")
+    assert entry.input_cost_per_million_above == Decimal("0.5")
+
+    below = estimate_usage_cost(
+        "claude-haiku-5-5",
+        CanonicalUsage(input_tokens=50_000, cache_read_tokens=40_000),
+        provider="xai",
+        base_url="https://api.x.ai/v1",
+    )
+    above = estimate_usage_cost(
+        "claude-haiku-5-5",
+        CanonicalUsage(input_tokens=50_000, cache_read_tokens=60_000),
+        provider="xai",
+        base_url="https://api.x.ai/v1",
+    )
+    # prompt = 90k -> base rates
+    assert below.amount_usd == Decimal(50_000) * Decimal("0.1") / Decimal(1_000_000) + Decimal(40_000) * Decimal("0.01") / Decimal(1_000_000)
+    # prompt = 110k -> whole request at tier rates
+    assert above.amount_usd == Decimal(50_000) * Decimal("0.5") / Decimal(1_000_000) + Decimal(60_000) * Decimal("0.05") / Decimal(1_000_000)

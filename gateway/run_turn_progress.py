@@ -622,6 +622,15 @@ class GatewayTurnProgressMixin:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
+        # Q-07: voice-turn progress speaks in VC instead of posting text (first ack per
+        # turn speaks, rest audit + suppress). Muted bubble: no id, so later edits skip.
+        try:
+            if await self._q07_voice_road_speak(self._ctx, st.adapter, text, "progress"):
+                st.can_edit = False
+                from types import SimpleNamespace as _SimpleNamespace
+                return _SimpleNamespace(success=True, message_id=None)
+        except Exception:
+            pass
         ctx = self._ctx
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,

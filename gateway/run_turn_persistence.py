@@ -584,7 +584,21 @@ class GatewayTurnPersistenceMixin:
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            _voice_spoke = await self._send_voice_reply(event, response)
+            # Q-07: voice-only + joined in VC — voice went out, audit + suppress the
+            # text twin (base path sends nothing when this returns None). Guarded so a
+            # gate error always falls through to the old text+voice behavior, never silence.
+            try:
+                _q07_gate = bool(_voice_spoke) and self._voice_only_active(event)
+            except Exception:
+                _q07_gate = False
+            if _q07_gate:
+                self._q07_audit("reply", getattr(event.source, "user_id", "?"),
+                                str(response or "")[:500])
+                if response and adapter and not agent_result.get("media_already_delivered"):
+                    with suppress(Exception):
+                        await self._deliver_media_from_response(response, event, adapter)
+                return None
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
