@@ -746,6 +746,14 @@ class VoiceReceiver:
         self._decode_failed = 0
         self._dave_unmapped_dropped = 0
         self._nacl_fail_streak = 0
+        # DAVE per-user decryptor health (jd 2026-10-29: group can lack a speaker —
+        # NoDecryptorForUser/NoValidCryptorFound — after commit contention or a session
+        # replace the snapshot missed). ssrc -> [first_monotonic, last_monotonic, count].
+        # Cleared on any successful decrypt for that SSRC; the adapter's listen loop
+        # promotes a stuck speaker to refresh, then throttled session re-init.
+        self._dave_fail: dict[int, list] = {}
+        self._dave_last_reinit: float = 0.0
+        self._dave_last_stale_refresh: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -857,6 +865,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._dave_fail.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
             "dave_unmapped_dropped=%d)",
@@ -1057,11 +1066,30 @@ class VoiceReceiver:
                     decrypted = dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
+                    with self._lock:
+                        self._dave_fail.pop(ssrc, None)
                 except Exception as e:
                     # Unencrypted passthrough — use NaCl-decrypted data as-is
                     if "Unencrypted" not in str(e):
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+                        # Missing-cryptor class (speaker not in our MLS group view):
+                        # record for the listen loop's refresh/re-init promotion. A
+                        # refresh here too — the session object may have been replaced
+                        # (reinit/Welcome) on a path our ws hook never sees (binary
+                        # MLS frames), leaving this snapshot permanently stale.
+                        if "NoDecryptorForUser" in str(e) or "NoValidCryptorFound" in str(e):
+                            now = time.monotonic()
+                            with self._lock:
+                                rec = self._dave_fail.get(ssrc)
+                                if rec is None:
+                                    self._dave_fail[ssrc] = [now, now, 1]
+                                else:
+                                    rec[1] = now
+                                    rec[2] += 1
+                            if now - self._dave_last_stale_refresh >= 5.0:
+                                self._dave_last_stale_refresh = now
+                                self.refresh_credentials("dave-missing-cryptor")
                         return
             elif (
                 dave_pver > 0
@@ -1125,6 +1153,23 @@ class VoiceReceiver:
         except Exception:
             pass
         return 0
+
+    def dave_resync_due(self, now=None):
+        """SSRC owed a session re-init, or None. A mapped speaker failing decrypt for
+        15s+ (refreshes already applied on the packet path) means our MLS group view
+        genuinely lacks them -- only a fresh key package / Welcome cycle heals it.
+        Throttled to one re-init per 60s; the caller re-inits then refreshes."""
+        now = time.monotonic() if now is None else now
+        if now - self._dave_last_reinit < 60.0:
+            return None
+        with self._lock:
+            mapped = {s for s in self._dave_fail if self._ssrc_to_user.get(s)}
+            for ssrc in sorted(mapped):
+                first, _last, _count = self._dave_fail[ssrc]
+                if now - first >= 15.0:
+                    self._dave_last_reinit = now
+                    return ssrc
+        return None
 
     def check_silence(self) -> list:
         """Return list of (user_id, pcm_bytes) for completed utterances."""
@@ -1235,10 +1280,37 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     MAX_SPLIT_MESSAGES = 8
 
     # Voice auto-disconnect after N idle seconds (discord.voice_channel_inactivity_timeout_seconds; 0 off).
-    VOICE_TIMEOUT = 300
+    # jd 2026-10-29: 120 backstop (was 300) — humans-gone leave lands via the 30s
+    # empty-VC grace; this only catches joined-but-silent sessions.
+    VOICE_TIMEOUT = 120
     # Minimum wait for one voice playback; the effective limit scales with clip duration.
     PLAYBACK_TIMEOUT = 120
     PLAYBACK_TIMEOUT_PADDING = 30
+
+    # jd-follow auto-join (scope §2, jd redirect 2026-10-29): when jd joins General VC
+    # the bot follows without a /voice summon. Locked recs: jd-only trigger, General-VC-only,
+    # quiet hours 22:00-08:00 ET block. Manual /voice join/leave stays as override.
+    AUTOJOIN_FOLLOW_USER_IDS = frozenset({483698221043023873})  # jd (jd_lewin)
+    AUTOJOIN_VC_ID = 482219586943451140  # General VC
+    AUTOJOIN_TEXT_CHANNEL_ID = 482219586943451138  # #general (transcription binding)
+    AUTOJOIN_COOLDOWN_SECONDS = 60  # one auto-join attempt per guild per burst
+    # jd 2026-10-29: 20s (was 30) — voice-state event latency eats part of the budget;
+    # 20s grace lands the leave ~30s after a real exit. Rejoin cancels (no flap leave).
+    AUTOJOIN_EMPTY_GRACE_SECONDS = 20  # humans-gone grace before auto-leave
+    AUTOJOIN_QUIET_START_HOUR_ET = 22
+    AUTOJOIN_QUIET_END_HOUR_ET = 8
+    # jd 2026-10-29 post-probe: Larry ONLY follows (bot user id below). Every adapter
+    # runs this module per-profile with no identity gate — ungated, all five joined.
+    AUTOJOIN_ONLY_BOT_ID = 1471523665370939515  # Larry bot
+    # All bot user ids on this guild (resolved live 2026-10-29): never count as humans
+    # in the empty-VC check, even if a partial member object lacks the bot flag.
+    KNOWN_BOT_IDS = frozenset({
+        1471523665370939515,  # larry
+        1561873101287854170,  # chewie
+        1562109248874217502,  # jack
+        1561857276137054238,  # marty
+        1562106375772045342,  # whistler
+    })
 
     def format_tool_preview(self, preview: ToolPreview) -> str:
         """Keep a truncated URL preview clickable in Discord markdown."""
@@ -1275,6 +1347,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        self._on_voice_autojoin: Optional[Callable] = None  # set by run.py (runner post-join wiring)
+        self._voice_autojoin_last: dict[int, float] = {}  # guild_id -> last auto-join attempt (monotonic)
+        self._voice_empty_leave_tasks: dict[int, asyncio.Task] = {}  # guild_id -> grace-period leave task
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
         # the inactivity timer keeps the bot in channel for /voice off, unlike /voice leave.
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
@@ -1556,7 +1631,20 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
+                """Track voice channel join/leave events; jd-follow auto-join; empty-VC auto-leave."""
+                # jd-follow auto-join runs FIRST and never depends on the bot already
+                # holding a VC in the guild (the tracking block below returns early when it holds none).
+                try:
+                    _after_ch = getattr(after, "channel", None)
+                    _gid = adapter_self._autojoin_candidate(member, _after_ch)
+                    if _gid is not None and _after_ch is not None:
+                        logger.info(
+                            "Voice autojoin: %s (%d) joined %s — following",
+                            member.display_name, member.id, _after_ch.name,
+                        )
+                        asyncio.ensure_future(adapter_self._run_voice_autojoin(_gid, _after_ch))
+                except Exception as e:
+                    logger.warning("Voice autojoin check failed: %s", e)
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return
@@ -1594,6 +1682,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             or after.channel == bot_channel
                         ):
                             receiver.refresh_credentials("membership change")
+                    # Empty-VC auto-leave (jd-follow scope): no humans left in the bot's
+                    # channel -> grace timer; a rejoin cancels it.
+                    try:
+                        await adapter_self._check_empty_vc(guild_id)
+                    except Exception as e:
+                        logger.warning("Empty-VC check failed: %s", e)
 
             # Register slash commands
             if self._slash_commands:
@@ -3788,7 +3882,151 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
-    async def join_voice_channel(self, channel, *, text_channel_id: int | None = None, source: dict | None = None) -> bool:
+    # --- jd-follow auto-join (scope §2) --------------------------------------
+
+    @staticmethod
+    def _autojoin_quiet_now_et() -> bool:
+        """True inside quiet hours 22:00-08:00 America/New_York (auto-join blocked)."""
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            # zoneinfo/tzdata missing: fall back to EDT (UTC-4, correct Mar-Nov).
+            from datetime import datetime, timedelta, timezone
+            now_et = datetime.now(timezone.utc) + timedelta(hours=-4)
+        return now_et.hour >= 22 or now_et.hour < 8
+
+    def _autojoin_candidate(self, member, after_channel) -> int | None:
+        """Guild id to auto-join, or None. Larry-bot ONLY, jd-only, General-VC-only,
+        quiet-hours + cooldown gated."""
+        try:
+            # Bot-identity gate: this module runs per-profile; only Larry follows.
+            me = getattr(getattr(self._client, "user", None), "id", None)
+            if int(me or 0) != self.AUTOJOIN_ONLY_BOT_ID:
+                return None
+            if after_channel is None or getattr(after_channel, "id", None) != self.AUTOJOIN_VC_ID:
+                return None
+            if getattr(member, "bot", False):
+                return None
+            if int(getattr(member, "id", 0) or 0) not in self.AUTOJOIN_FOLLOW_USER_IDS:
+                return None
+            guild = getattr(member, "guild", None)
+            guild_id = getattr(guild, "id", None)
+            if guild_id is None:
+                return None
+            if self._autojoin_quiet_now_et():
+                logger.info("[Discord] autojoin skip: quiet hours (jd joined General VC)")
+                return None
+            vc = self._voice_clients.get(guild_id)
+            if vc is not None and vc.is_connected():
+                return None
+            now = time.monotonic()
+            if now - self._voice_autojoin_last.get(guild_id, 0.0) < self.AUTOJOIN_COOLDOWN_SECONDS:
+                return None
+            self._voice_autojoin_last[guild_id] = now
+            return int(guild_id)
+        except Exception:
+            return None
+
+    async def _run_voice_autojoin(self, guild_id: int, channel) -> None:
+        """Follow jd into General VC. $0 local STT/TTS path only; no new deps, no disk writes."""
+        try:
+            text_channel_id = self._voice_text_channels.get(guild_id) or self.AUTOJOIN_TEXT_CHANNEL_ID
+            # source=None: a marker dict here would poison _voice_input_source
+            # (SessionSource.from_dict needs platform/chat_id — KeyError 'platform').
+            # None keeps the binding and falls back to the text-path-shaped source.
+            ok = await self.join_voice_channel(
+                channel, text_channel_id=text_channel_id, source=None,
+            )
+            logger.info(
+                "[Discord] autojoin %s (guild=%d vc=%s)",
+                "joined" if ok else "FAILED", guild_id, getattr(channel, "name", "?"),
+            )
+            if ok:
+                try:
+                    await self._check_empty_vc(guild_id)
+                except Exception as e:
+                    logger.warning("[Discord] post-join empty check failed: %s", e)
+            if ok and callable(getattr(self, "_on_voice_autojoin", None)):
+                try:
+                    res = self._on_voice_autojoin(int(guild_id), int(text_channel_id))
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception as e:
+                    logger.warning("[Discord] autojoin post-join wiring failed: %s", e)
+        except Exception as e:
+            logger.warning("[Discord] autojoin error: %s", e)
+
+    def _cancel_empty_vc_leave(self, guild_id: int) -> None:
+        task = self._voice_empty_leave_tasks.pop(guild_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _schedule_empty_vc_leave(self, guild_id: int) -> None:
+        """Start the empty-VC grace timer; a rejoin cancels it."""
+        if self._voice_empty_leave_tasks.get(guild_id) is not None:
+            return
+
+        async def _grace() -> None:
+            try:
+                await asyncio.sleep(self.AUTOJOIN_EMPTY_GRACE_SECONDS)
+                vc = self._voice_clients.get(guild_id)
+                if vc is None or not vc.is_connected():
+                    return
+                humans = self._humans_in_vc(guild_id)
+                if humans is None:
+                    return
+                if humans:
+                    return
+                text_ch_id = self._voice_text_channels.get(guild_id)
+                logger.info("[Discord] auto-leave: VC empty past grace (guild=%d)", guild_id)
+                await self.leave_voice_channel(guild_id)
+                cb = getattr(self, "_on_voice_disconnect", None)
+                if callable(cb) and text_ch_id:
+                    try:
+                        cb(str(text_ch_id))
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("[Discord] empty-VC leave failed: %s", e)
+            finally:
+                self._voice_empty_leave_tasks.pop(guild_id, None)
+
+        self._voice_empty_leave_tasks[guild_id] = asyncio.ensure_future(_grace())
+
+    def _humans_in_vc(self, guild_id: int) -> list | None:
+        """Non-bot members of the bot's VC, or None when membership is unreadable.
+        Bots never count: the bot flag, our own id, AND the known bot-id set (partial
+        member objects can lack flags)."""
+        vc = self._voice_clients.get(guild_id)
+        if vc is None or not vc.is_connected():
+            return []
+        channel = getattr(vc, "channel", None)
+        try:
+            members = list(getattr(channel, "members", None) or [])
+        except Exception:
+            return None
+        bot_id = getattr(getattr(self._client, "user", None), "id", None)
+        known = self.KNOWN_BOT_IDS
+        return [m for m in members
+                if not getattr(m, "bot", False)
+                and getattr(m, "id", None) != bot_id
+                and getattr(m, "id", None) not in known]
+
+    async def _check_empty_vc(self, guild_id: int) -> None:
+        """Humans present -> cancel grace timer; none left -> start it."""
+        humans = self._humans_in_vc(guild_id)
+        if humans is None:
+            return
+        if humans:
+            self._cancel_empty_vc_leave(guild_id)
+        else:
+            self._schedule_empty_vc_leave(guild_id)
+
+    async def join_voice_channel(self, channel, *, text_channel_id: int | None = None, source: Any | None = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
         transcription-routing binding so programmatic joins work without ``/voice join``."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -4014,6 +4252,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not receiver:
             return
         last_keepalive = time.monotonic()
+        last_dave_check = 0.0
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -4026,6 +4265,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
+                # DAVE health (~1/s): session-identity guard + stuck-speaker resync.
+                # reinit_dave_session() REPLACES conn.dave_session (new object) on paths
+                # our ws hook never sees (binary MLS frames, invalid-commit recovery),
+                # which used to leave this receiver decrypting against a dead snapshot.
+                if now - last_dave_check >= 1.0:
+                    last_dave_check = now
+                    try:
+                        vc = self._voice_clients.get(guild_id)
+                        conn = vc._connection if vc is not None else None
+                        if conn is not None:
+                            if receiver._creds[1] is not conn.dave_session:
+                                receiver.refresh_credentials('dave-session-replaced')
+                            else:
+                                due = receiver.dave_resync_due(now)
+                                if due is not None:
+                                    logger.warning(
+                                        '[Discord] DAVE resync: re-init session (stuck ssrc=%d, guild=%d)',
+                                        due, guild_id,
+                                    )
+                                    await conn.reinit_dave_session()
+                                    receiver.refresh_credentials('dave-resync')
+                    except Exception as e:
+                        logger.warning('[Discord] DAVE health check failed: %s', e)
                 completed = receiver.check_silence()
                 # Each utterance keeps the binding it was collected under, not one set during an earlier STT.
                 captured_for = self._voice_text_channels.get(guild_id)

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from gateway.session import SessionSource
 
 
 class DiscordVoiceInfoMixin:
@@ -13,12 +16,18 @@ class DiscordVoiceInfoMixin:
     _client: Any
     discard_pending_voice_input: Any
 
-    def _bind_voice_text_channel(self, guild_id: int, text_channel_id: Any, source: Optional[dict]) -> None:
+    def _bind_voice_text_channel(self, guild_id: int, text_channel_id: Any, source: Optional[Any]) -> None:
         """A programmatic join's transcription binding, on every path: cold join, same voice channel and
         move. The already-connected paths returned before writing it, so a successful join to another
         text channel kept answering in the old one. Moving to another text channel drops speech captured
         for the old one (as ``/voice join`` does) and, unless a new source is given, the old channel's
-        bound source, whose chat would otherwise keep routing turns into the old conversation."""
+        bound source, whose chat would otherwise keep routing turns into the old conversation.
+
+        Write choke point: ``source`` is ``SessionSource | dict | None``. A SessionSource
+        is stored via ``to_dict()`` (always carries platform/chat_id); a bare dict is
+        stamped with ``platform`` (and ``chat_id`` fallback) so ``_voice_input_source``
+        rehydrate never hits ``KeyError: 'platform'``.
+        """
         if text_channel_id is not None:
             previous = self._voice_text_channels.get(guild_id)
             if previous is not None and previous != text_channel_id:
@@ -27,7 +36,14 @@ class DiscordVoiceInfoMixin:
                     self._voice_sources.pop(guild_id, None)
             self._voice_text_channels[guild_id] = text_channel_id
         if source is not None:
-            self._voice_sources[guild_id] = source
+            to_dict = getattr(source, "to_dict", None)
+            data = dict(to_dict()) if callable(to_dict) else dict(source)
+            if not data.get("platform"):
+                plat = getattr(getattr(self, "platform", None), "value", None) or "discord"
+                data["platform"] = plat
+            if not data.get("chat_id") and text_channel_id is not None:
+                data["chat_id"] = str(text_channel_id)
+            self._voice_sources[guild_id] = data
 
     def get_voice_channel_info(self, guild_id: int) -> Optional[dict[str, Any]]:
         """Return voice channel info (name, members, count, speaking user IDs) or None if not connected."""

@@ -692,16 +692,11 @@ class GatewaySlashCommandsMixin(
         adapter = self._delivery_adapter_for(event.source)
 
         def _set_mode(mode: str) -> None:
-            self._voice_mode[voice_key] = mode
-            self._save_voice_modes()
-            from gateway.session_config import local_voice_transition
-            local_voice_transition(event.source, mode)
-            if not adapter:
-                return
-            if mode == "off":
-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-            else:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+            # Single choke point: persists to gateway_voice_mode.json, mirrors the
+            # adapter auto-TTS sets AND _voice_only_chats (echo suppression reads
+            # that set — bypassing it here silently unmuted transcript echoes).
+            # Adapter-None safe (persist still lands; mirror no-ops).
+            self._apply_voice_mode(adapter, voice_key, chat_id, mode)
 
         if args in _VOICE_MODE_BY_ARG:
             mode, reply_key = _VOICE_MODE_BY_ARG[args]

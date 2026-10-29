@@ -896,6 +896,9 @@ class GatewayAdapterLifecycleMixin:
             recover_api_turns(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
+        if hasattr(adapter, "_on_voice_autojoin") and hasattr(self, "_handle_voice_autojoin"):
+            adapter._on_voice_autojoin = functools.partial(
+                self._handle_voice_autojoin, adapter=adapter)
 
     def _schedule_planned_restart_replay(self) -> None:
         """Replay the owed planned-restart notice after a reconnect, in the background: notification delivery
@@ -1418,6 +1421,9 @@ class GatewayAdapterLifecycleMixin:
         )
         # Voice transcripts from this bot's channels dispatch through THIS adapter.
         self._bind_voice_input_callback(adapter)
+        if hasattr(adapter, "_on_voice_autojoin") and hasattr(self, "_handle_voice_autojoin"):
+            adapter._on_voice_autojoin = functools.partial(
+                self._handle_voice_autojoin, adapter=adapter)
         # Secondary adapters carry their profile so prune paths namespace topic bindings correctly.
         # See #76423.
         adapter._hermes_profile_name = profile_name

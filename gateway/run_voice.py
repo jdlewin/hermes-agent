@@ -103,6 +103,15 @@ class GatewayVoiceMixin:
         self._voice_mode[voice_key] = mode
         self._save_voice_modes()
         self._toggle_adapter_auto_tts_set(adapter, chat_id, True, enable=mode != "off")
+        # Q-07: voice_only membership rides on the delivering adapter (chat-scoped, so it
+        # survives profile-key divergence); mode all keeps the text twin.
+        with suppress(Exception):
+            only = getattr(adapter, "_voice_only_chats", None)
+            if isinstance(only, set):
+                if mode == "voice_only":
+                    only.add(str(chat_id))
+                else:
+                    only.discard(str(chat_id))
 
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live adapter: ``_auto_tts_default`` from
@@ -137,6 +146,13 @@ class GatewayVoiceMixin:
             chats.clear()
             chats.update(key[len(prefix):] for key, mode in self._voice_mode.items()
                          if mode in modes and key.startswith(prefix))
+        # Q-07: restore voice_only membership the same way (chat-scoped, profile-agnostic).
+        with suppress(Exception):
+            only = getattr(adapter, "_voice_only_chats", None)
+            if isinstance(only, set):
+                only.clear()
+                only.update(key[len(prefix):] for key, mode in self._voice_mode.items()
+                            if mode == "voice_only" and key.startswith(prefix))
 
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
@@ -186,9 +202,93 @@ class GatewayVoiceMixin:
         adapter._voice_text_channels[guild_id] = text_channel_id
         if hasattr(adapter, "_voice_sources"):
             adapter._voice_sources[guild_id] = event.source.to_dict()
-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
-                               event.source.chat_id, "all")
+        # Q-07: joining must not clobber an explicit mode — jd's /voice on (voice_only)
+        # survived until the next /voice join reset it to all. Only default when unset.
+        _join_key = self._voice_key_for_source(event.source)
+        if self._voice_mode.get(_join_key) != 'voice_only':
+            self._apply_voice_mode(adapter, _join_key,
+                                   event.source.chat_id, "all")
+        else:
+            self._sync_voice_only_to_adapter(adapter, event.source.chat_id)
         return t("gateway.voice.channel_joined", name=voice_channel.name)
+
+    def _sync_voice_only_to_adapter(self, adapter, chat_id) -> None:
+        """Re-mirror voice_only membership onto one adapter from the live mode file."""
+        with suppress(Exception):
+            only = getattr(adapter, "_voice_only_chats", None)
+            if isinstance(only, set):
+                if self._q07_voice_only_chat(chat_id):
+                    only.add(str(chat_id))
+                else:
+                    only.discard(str(chat_id))
+
+    async def _q07_voice_road_speak(self, ctx, adapter, text: str, kind: str) -> bool:
+        """Q-07 mid-turn voice road: acks, commentary and progress on a voice turn speak
+        instead of posting when voice_only + VC-bound. First one per turn speaks; the
+        rest audit + suppress. True = drop the text twin. Fail open (False) on any miss
+        so text still posts when speech is unavailable."""
+        try:
+            if not getattr(ctx, "voice_turn", False):
+                return False
+            source = getattr(ctx, "source", None)
+            chat_id = getattr(source, "chat_id", None)
+            if not chat_id or not self._q07_voice_only_chat(chat_id):
+                return False
+            gid, vc_ok = None, False
+            try:
+                bind = getattr(adapter, "_voice_text_channels", None) or {}
+                clients = getattr(adapter, "_voice_clients", None) or {}
+                for _g, _tc in bind.items():
+                    _vc = clients.get(_g)
+                    if str(_tc) == str(chat_id) and _vc is not None and callable(
+                            getattr(_vc, "is_connected", None)) and _vc.is_connected():
+                        gid = _g
+                        vc_ok = True
+                        break
+            except Exception:
+                return False
+            if not vc_ok:
+                return False
+            try:
+                self._q07_audit(kind, getattr(source, "user_id", "?"), str(text or "")[:500])
+            except Exception:
+                pass
+            if getattr(ctx, "_q07_ack_spoken", False):
+                return True
+            try:
+                import asyncio as _aio
+                import tempfile as _tf
+                from tools.tts_text_normalize import _strip_markdown_for_tts
+                from tools.tts_tool import text_to_speech_tool
+                tts_text = _strip_markdown_for_tts(str(text or ""))
+                if not tts_text:
+                    return True
+                with _tf.TemporaryDirectory() as _td:
+                    _out = os.path.join(_td, "q07ack.mp3")
+                    raw = await _aio.to_thread(text_to_speech_tool, text=tts_text,
+                                               output_path=_out)
+                    try:
+                        result = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        return False
+                    cands = result.get("file_paths") or [result.get("file_path", _out)]
+                    paths = [str(p) for p in cands if p and os.path.isfile(p)]
+                    if not result.get("success") or not paths:
+                        return False
+                    play = getattr(adapter, "play_in_voice_channel", None)
+                    if not callable(play):
+                        return False
+                    if not bool(await play(gid, paths[0])):  # type: ignore[misc]
+                        return False
+            except Exception:
+                return False
+            try:
+                ctx._q07_ack_spoken = True
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
@@ -230,6 +330,28 @@ class GatewayVoiceMixin:
                               profile=getattr(adapter, "_owner_profile", None))
         self._apply_voice_mode(adapter, key, chat_id, "off")
 
+    def _handle_voice_autojoin(self, guild_id: int, text_channel_id: int, *, adapter=None) -> None:
+        """Runner-side post-join wiring for jd-follow auto-joins: mirrors the manual-join
+        block in ``_handle_voice_channel_join`` (input callback, disconnect cleanup, live
+        mode getter, default voice mode ``all`` when unset — never clobbers ``voice_only``)."""
+        try:
+            self._bind_voice_input_callback(adapter)
+            voice_profile = getattr(adapter, "_owner_profile", None) or "default"
+            if hasattr(adapter, "_on_voice_disconnect"):
+                adapter._on_voice_disconnect = functools.partial(
+                    self._handle_voice_timeout_cleanup, adapter=adapter)
+            if hasattr(adapter, "_voice_mode_getter"):
+                adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                    self._voice_key(Platform.DISCORD, str(chat_id), profile=voice_profile), "off")
+            key = self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile)
+            if self._voice_mode.get(key) != 'voice_only':
+                self._apply_voice_mode(adapter, key, str(text_channel_id), "all")
+            else:
+                self._sync_voice_only_to_adapter(adapter, str(text_channel_id))
+            logger.info("Voice autojoin wired (guild=%s chat=%s)", guild_id, text_channel_id)
+        except Exception as e:
+            logger.warning("Voice autojoin wiring failed: %s", e)
+
     def _is_duplicate_voice_transcript(self, binding: tuple, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for one recent utterance (voice capture can emit it twice a
         few seconds apart -> a second queued run and overlapping spoken replies). ``binding`` is
@@ -270,7 +392,9 @@ class GatewayVoiceMixin:
         display_name = getattr(member, "display_name", None)
         user_name = display_name if isinstance(display_name, str) and display_name else None
         channel = client.get_channel(int(text_ch_id)) if client else None
-        if source_data := getattr(adapter, "_voice_sources", {}).get(guild_id):
+        source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
+        if (isinstance(source_data, dict) and source_data.get("platform")
+                and source_data.get("chat_id")):
             source = SessionSource.from_dict(source_data)
             # get_member() is cache-only: on a miss the /voice join invoker keeps the name bound at
             # join, never another participant's.
@@ -341,13 +465,22 @@ class GatewayVoiceMixin:
             logger.info("Suppressing duplicate voice transcript for guild=%s user=%s: %s",
                         guild_id, user_id, transcript[:100])
             return
-        # Echo the transcript into the text channel (after auth, with mention sanitization).
+        # Echo the transcript into the text channel (after auth, with mention sanitization)
+        # — unless Q-07 voice-only is active: then nothing lands in #general, audit file only.
+        _q07_voice_only = False
         with suppress(Exception):
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
-                safe_text = safe_text.replace("@here", "@\u200bhere")
-                await channel.send(t("gateway.voice.transcript_echo", user=user_id, text=safe_text))
+            _q07_voice_only = (
+                self._q07_voice_only_chat(text_ch_id)
+                and bool(getattr(adapter, "is_in_voice_channel", lambda *_a: False)(guild_id)))
+        if _q07_voice_only:
+            self._q07_audit("transcript", user_id, transcript[:500])
+        else:
+            with suppress(Exception):
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
+                    safe_text = safe_text.replace("@here", "@\u200bhere")
+                    await channel.send(t("gateway.voice.transcript_echo", user=user_id, text=safe_text))
         # Bound text channel's channel_prompt and skills: voice input gets the same per-channel
         # context, and a first spoken turn opens the session, the only point skills load.
         # A thread inherits its parent's bindings, as its typed messages do.
@@ -388,7 +521,10 @@ class GatewayVoiceMixin:
         if event.source.platform == Platform.LOCAL:
             return False
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
+        try:
+            voice_mode = self._voice_armed_for_chat(chat_id)
+        except Exception:
+            voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
         is_voice_input = event.message_type == MessageType.VOICE
         adapter = self._delivery_adapter_for(event.source)
         adapter_auto_tts = False
@@ -411,22 +547,110 @@ class GatewayVoiceMixin:
             return False
         # Dedup: base adapter auto-TTS already handles voice input (play_tts plays in VC when
         # connected) — unless streaming consumed the text (already_sent): then the runner must.
-        return not (is_voice_input and not already_sent)
+        # When base auto-TTS is not armed for this chat, nothing else would speak, so the
+        # runner delivers instead (VC when joined, else a voice message) — no silent turns.
+        # Q-07: voice-only + joined in VC — the runner is the single speaker; the delivery
+        # decision below returns None so the base path sends no text.
+        if is_voice_input and not already_sent:
+            if self._voice_only_active(event):
+                return True
+            return not adapter_auto_tts
+        return True
 
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    # Q-07 voice-only audit: transcripts + spoken replies land here, never in #general.
+    _Q07_AUDIT_PATH = "/Users/lawrence/ops/discord-voice-build/q07-audit.log"
+    _Q07_MODE_PATH = "/Users/lawrence/.hermes/gateway_voice_mode.json"
+
+    @staticmethod
+    def _voice_armed_for_chat(chat_id) -> str:
+        """Live file-backed arm state for a chat across ALL mode homes (host file plus
+        every profile home): most-recently-written file wins; bare or profile-prefixed
+        keys match. ONE source of truth, no per-runner in-memory drift, so a resumed
+        session after restart reads the same arm the writer saved."""
+        try:
+            import glob as _glob
+            cands = ['/Users/lawrence/.hermes/gateway_voice_mode.json'] + sorted(
+                _glob.glob('/Users/lawrence/.hermes/profiles/*/gateway_voice_mode.json'))
+            best, best_mtime = 'off', -1.0
+            for _p in cands:
+                try:
+                    _mtime = __import__('os').stat(_p).st_mtime
+                    with open(_p, encoding='utf-8-sig') as _f:
+                        data = json.load(_f)
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                hit = [v for k, v in data.items()
+                       if str(k).split(':')[-1] == str(chat_id) and v in _VOICE_MODES]
+                if hit and _mtime >= best_mtime:
+                    best, best_mtime = hit[-1], _mtime
+            return best
+        except Exception:
+            return 'off'
+
+    @staticmethod
+    def _q07_voice_only_chat(chat_id) -> bool:
+        """Profile-proof voice_only check shared by all Q-07 gates: ANY profile key for
+        this chat with voice_only counts, across the gateway root file and every
+        profile home file. File-backed, no per-adapter drift."""
+        try:
+            import glob as _glob
+            paths = ["/Users/lawrence/.hermes/gateway_voice_mode.json"] + sorted(
+                _glob.glob("/Users/lawrence/.hermes/profiles/*/gateway_voice_mode.json"))
+            for _p in paths:
+                try:
+                    with open(_p, encoding="utf-8-sig") as _f:
+                        data = json.load(_f)
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if any(str(k).split(":")[-1] == str(chat_id) and v == "voice_only"
+                       for k, v in data.items()):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _q07_audit(kind: str, user_id, text: str) -> None:
+        try:
+            with open(GatewayVoiceMixin._Q07_AUDIT_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {kind} user={user_id} {text}\n")
+        except OSError:
+            pass
+
+    def _voice_only_active(self, event: MessageEvent) -> bool:
+        """Q-07: voice_only mode for this chat AND bot joined in this guild's VC.
+        Mode check is file-backed (profile-proof); VC check is adapter-local."""
+        try:
+            if event.message_type != MessageType.VOICE:
+                return False
+            if not self._q07_voice_only_chat(event.source.chat_id):
+                return False
+            adapter = self._delivery_adapter_for(event.source)
+            guild_id = self._get_guild_id(event)
+            is_in_vc = getattr(adapter, "is_in_voice_channel", None)
+            return bool(guild_id and callable(is_in_vc) and is_in_vc(guild_id))
+        except Exception:
+            return False
+
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply. The TTS tool
         may return one combined file or several separately valid ones (combination unavailable /
-        over a platform limit); legacy single-file results keep working."""
+        over a platform limit); legacy single-file results keep working.
+        Returns True when audio was delivered (Q-07 uses it to suppress the text twin)."""
         audio_path, actual_paths = None, []
         try:
             from tools.tts_text_normalize import _strip_markdown_for_tts
             from tools.tts_tool import text_to_speech_tool
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
             audio_path = build_auto_tts_output_path(event.source.platform)
@@ -437,33 +661,36 @@ class GatewayVoiceMixin:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s",
                                raw[:200] if raw else raw)
-                return
+                return False
             candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
             paths = [str(p) for p in candidates if p and os.path.isfile(p)]
             if not result.get("success") or not paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
             actual_paths = paths
-            await self._deliver_voice_reply(event, actual_paths)
+            return await self._deliver_voice_reply(event, actual_paths)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 with suppress(OSError):
                     os.unlink(p)
 
-    async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: list[str]) -> None:
-        """Play the files in the connected voice channel, else send them as voice messages."""
+    async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: list[str]) -> bool:
+        """Play the files in the connected voice channel, else send them as voice messages.
+        Returns True when audio went out on at least one route."""
         adapter = self._delivery_adapter_for(event.source)
         guild_id = self._get_guild_id(event)
         play = getattr(adapter, "play_in_voice_channel", None)
         is_in_vc = getattr(adapter, "is_in_voice_channel", None)
         if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
+            ok = True
             for path in audio_paths:
-                await play(guild_id, path)
-            return
+                ok = bool(await play(guild_id, path)) and ok  # type: ignore[misc]
+            return ok
         if not callable(send_voice := getattr(adapter, "send_voice", None)):
-            return
+            return False
         reply_anchor = self._reply_anchor_for_event(event)
         # notify=True mirrors the final-text path in platforms/base.py so notification-gating
         # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
@@ -472,3 +699,4 @@ class GatewayVoiceMixin:
         for path in audio_paths:
             await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
                              metadata=thread_meta)
+        return True
